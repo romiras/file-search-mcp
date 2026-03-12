@@ -106,6 +106,8 @@ impl SearchTool {
     /// Perform full-text search for keywords on text files (such as .txt, .md, etc.) in the specified directory
     #[tool(description = "Search for keywords in text files within the specified directory")]
     async fn search(&self, #[tool(aggr)] params: SearchParams) -> Result<String, String> {
+        let start_time = std::time::Instant::now();
+
         // 1. Define schema for Tantivy (file paths and content)
         let mut schema_builder = Schema::builder();
         let path_field = schema_builder.add_text_field("path", STORED);
@@ -141,6 +143,9 @@ impl SearchTool {
                 params.directory
             ));
         }
+
+        // Directories to always skip
+        let skip_dirs = [".git", "target", "node_modules", ".vscode", "build", "dist"];
 
         // Blacklist of extensions likely to be binary files
         // Skip extensions that are clearly binary files
@@ -208,6 +213,7 @@ impl SearchTool {
             path_field: tantivy::schema::Field,
             content_field: tantivy::schema::Field,
             binary_extensions: &[&str],
+            skip_dirs: &[&str],
             indexed_files_count: &mut usize,
             found_files_count: &mut usize,
             skipped_files_count: &mut usize,
@@ -220,12 +226,19 @@ impl SearchTool {
 
                 if path.is_dir() {
                     // Recursively process subdirectories (add depth limit if needed)
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if skip_dirs.iter().any(|&d| d == name) {
+                            tracing::debug!("Skipping directory: {}", path.display());
+                            continue;
+                        }
+                    }
                     process_directory(
                         &path,
                         index_writer,
                         path_field,
                         content_field,
                         binary_extensions,
+                        skip_dirs,
                         indexed_files_count,
                         found_files_count,
                         skipped_files_count,
@@ -267,20 +280,23 @@ impl SearchTool {
         }
 
         // Execute directory processing
-        tracing::info!("Target directory for search: {}", dir_path.display());
+        tracing::info!("Starting indexing for: {}", dir_path.display());
         process_directory(
             dir_path,
             &mut index_writer,
             path_field,
             content_field,
             &binary_extensions,
+            &skip_dirs,
             &mut indexed_files_count,
             &mut found_files_count,
             &mut skipped_files_count,
         )?;
 
+        let indexing_duration = start_time.elapsed();
         tracing::info!(
-            "Processing complete: Found files={}, Indexed={}, Skipped={}",
+            "Indexing complete in {:?}: Found={}, Indexed={}, Skipped={}",
+            indexing_duration,
             found_files_count,
             indexed_files_count,
             skipped_files_count
@@ -289,17 +305,20 @@ impl SearchTool {
         // Return an error if no files were indexed
         if indexed_files_count == 0 {
             return Ok(format!(
-                "No text files suitable for indexing were found in the specified directory '{}'.\nFound files: {}, Skipped: {}\nSupported extensions: {:?}",
-                params.directory, found_files_count, skipped_files_count, binary_extensions
+                "No text files were indexed in '{}' (took {:?}).",
+                params.directory, indexing_duration
             ));
         }
 
         // 5. Commit the index
+        let commit_start = std::time::Instant::now();
         index_writer
             .commit()
             .map_err(|e| format!("Commit error: {}", e))?;
+        tracing::debug!("Commit complete in {:?}", commit_start.elapsed());
 
         // 6. Generate reader and searcher for searching
+        let search_start = std::time::Instant::now();
         let reader = index.reader().map_err(|e| e.to_string())?;
         let searcher = reader.searcher();
 
@@ -308,7 +327,7 @@ impl SearchTool {
 
         // Ensure the keyword is not empty
         if params.keyword.trim().is_empty() {
-            return Err("Search keyword is empty. Please enter a valid keyword.".into());
+            return Err("Search keyword is empty.".into());
         }
 
         let query = query_parser
@@ -332,17 +351,51 @@ impl SearchTool {
             result_str.push_str(&format!("Hit: {} (Score: {:.2})\n", path_value, score));
         }
 
+        let total_duration = start_time.elapsed();
+        tracing::info!("Search completed in {:?}", search_start.elapsed());
+        tracing::info!("Total request time: {:?}", total_duration);
+
         if result_str.is_empty() {
             Ok(format!(
-                "No search results for keyword '{}'. Number of indexed files: {}",
-                params.keyword, indexed_files_count
+                "No results for '{}'. Indexed {} files in {:?}.",
+                params.keyword, indexed_files_count, indexing_duration
             ))
         } else {
             Ok(format!(
-                "Search results ({} hits):\n{}",
+                "Search results ({} hits, took {:?} total):\n{}",
                 top_docs.len(),
+                total_duration,
                 result_str
             ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_skip_dirs_logic() {
+        let skip_dirs = [".git", "target", "node_modules", ".vscode", "build", "dist"];
+        let test_cases = [
+            (".git", true),
+            ("target", true),
+            ("src", false),
+            ("node_modules", true),
+            ("my_folder", false),
+        ];
+
+        for (dir_name, expected_skip) in test_cases {
+            let path = Path::new(dir_name);
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let should_skip = skip_dirs.iter().any(|&d| d == name);
+            assert_eq!(
+                should_skip, expected_skip,
+                "Failed for directory: {}",
+                dir_name
+            );
         }
     }
 }
