@@ -1,11 +1,15 @@
+use hex;
 use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, schemars, tool};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{STORED, Schema, TextFieldIndexing, TextOptions, Value};
-use tantivy::{Index, TantivyDocument, doc};
+use tantivy::schema::{INDEXED, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value};
+use tantivy::{Index, TantivyDocument, Term, doc};
 use tracing;
 
 // Search parameters: directory path and search keyword
@@ -32,6 +36,47 @@ pub struct SearchTool;
 impl SearchTool {
     pub fn new() -> Self {
         Self {}
+    }
+
+    /// Get the cache directory for a specific search path
+    fn get_index_path(&self, directory: &str) -> Result<PathBuf, String> {
+        let abs_path = fs::canonicalize(directory)
+            .map_err(|e| format!("Failed to canonicalize path '{}': {}", directory, e))?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(abs_path.to_string_lossy().as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
+        let mut cache_dir =
+            dirs::cache_dir().ok_or_else(|| "Could not determine cache directory".to_string())?;
+        cache_dir.push("file-search-mcp");
+        cache_dir.push(hash);
+
+        if !cache_dir.exists() {
+            fs::create_dir_all(&cache_dir)
+                .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+        }
+
+        Ok(cache_dir)
+    }
+
+    /// Define the Tantivy schema
+    fn get_schema(&self) -> Schema {
+        let mut schema_builder = Schema::builder();
+        // Use STRING for path to make it easy to delete/lookup (not tokenized)
+        schema_builder.add_text_field("path", STRING | STORED);
+
+        // Content field for full-text search
+        let text_indexing = TextFieldIndexing::default().set_tokenizer("default");
+        let text_options = TextOptions::default()
+            .set_indexing_options(text_indexing)
+            .set_stored();
+        schema_builder.add_text_field("content", text_options);
+
+        // Modified time for incremental indexing
+        schema_builder.add_i64_field("modified", INDEXED | STORED);
+
+        schema_builder.build()
     }
 
     /// Read and return the content of a specified file
@@ -108,32 +153,57 @@ impl SearchTool {
     async fn search(&self, #[tool(aggr)] params: SearchParams) -> Result<String, String> {
         let start_time = std::time::Instant::now();
 
-        // 1. Define schema for Tantivy (file paths and content)
-        let mut schema_builder = Schema::builder();
-        let path_field = schema_builder.add_text_field("path", STORED);
+        // 1. Prepare schema and index path
+        let schema = self.get_schema();
+        let path_field = schema.get_field("path").map_err(|e| e.to_string())?;
+        let content_field = schema.get_field("content").map_err(|e| e.to_string())?;
+        let modified_field = schema.get_field("modified").map_err(|e| e.to_string())?;
 
-        // Improve content field settings: explicitly set indexing options
-        let text_indexing = TextFieldIndexing::default().set_tokenizer("default");
-        let text_options = TextOptions::default()
-            .set_indexing_options(text_indexing)
-            .set_stored();
-        let content_field = schema_builder.add_text_field("content", text_options);
+        let index_path = self.get_index_path(&params.directory)?;
+        tracing::debug!("Using index at: {}", index_path.display());
 
-        let schema = schema_builder.build();
+        // 2. Open or create index
+        let index = if index_path.join("meta.json").exists() {
+            Index::open_in_dir(&index_path).map_err(|e| format!("Failed to open index: {}", e))?
+        } else {
+            Index::create_in_dir(&index_path, schema.clone())
+                .map_err(|e| format!("Failed to create index: {}", e))?
+        };
 
-        // 2. Create in-memory index
-        let index = Index::create_in_ram(schema.clone());
+        // 3. Load existing documents' modification times to support incremental indexing
+        let mut existing_files: HashMap<String, i64> = HashMap::new();
+        {
+            let reader = index.reader().map_err(|e| e.to_string())?;
+            let searcher = reader.searcher();
+            let segment_readers = searcher.segment_readers();
+            for segment_reader in segment_readers {
+                let store_reader = segment_reader
+                    .get_store_reader(100)
+                    .map_err(|e| e.to_string())?;
+                for doc_id in 0..segment_reader.max_doc() {
+                    if !segment_reader.is_deleted(doc_id) {
+                        let doc: TantivyDocument =
+                            store_reader.get(doc_id).map_err(|e| e.to_string())?;
+                        if let (Some(path), Some(modified)) = (
+                            doc.get_first(path_field).and_then(|v| v.as_str()),
+                            doc.get_first(modified_field).and_then(|v| v.as_i64()),
+                        ) {
+                            existing_files.insert(path.to_string(), modified);
+                        }
+                    }
+                }
+            }
+        }
 
-        // 3. Create index writer (adjust buffer size as needed)
+        // 4. Create index writer
         let mut index_writer = index
             .writer(50_000_000)
             .map_err(|e| format!("Index writer error: {}", e))?;
 
         // Count the number of files added to the index
         let mut indexed_files_count = 0;
-        // Track directory processing status (for debugging)
-        let mut found_files_count = 0;
         let mut skipped_files_count = 0;
+        let mut deleted_files_count = 0;
 
         // 4. Read text files in the specified directory and add them to the index
         let dir_path = Path::new(&params.directory);
@@ -144,8 +214,12 @@ impl SearchTool {
             ));
         }
 
-        // Directories to always skip
-        let skip_dirs = [".git", "target", "node_modules", ".vscode", "build", "dist"];
+        // Directories to always skip (common heavy/internal dirs)
+        let skip_dirs = [
+            ".git", "target", "node_modules", ".vscode", "build", "dist",
+            ".venv", "venv", "env", "__pycache__", ".tox",
+            ".next", ".nuxt", ".svelte-kit", ".turbo",
+        ];
 
         // Blacklist of extensions likely to be binary files
         // Skip extensions that are clearly binary files
@@ -156,176 +230,143 @@ impl SearchTool {
             "xlsx", "ppt", "pptx", "db", "sqlite", "mdb", "iso", "dmg", "class",
         ];
 
-        // Function to determine if a file is a text file
-        fn is_text_file(path: &Path, binary_extensions: &[&str]) -> bool {
-            // 1. First check extensions that are clearly binary
-            if let Some(ext) = path.extension() {
-                let ext_str = ext.to_string_lossy().to_lowercase();
-                if binary_extensions.iter().any(|&bin_ext| bin_ext == ext_str) {
-                    return false;
-                }
-            }
+        // Track files found in current scan to identify deleted files later
+        let mut current_scan_files = HashMap::new();
 
-            // 2. Read the beginning of the file and determine if it is binary
-            match fs::read(path) {
-                Ok(bytes) if !bytes.is_empty() => {
-                    // Sample size (read up to 8KB)
-                    let sample_size = std::cmp::min(bytes.len(), 8192);
-                    let sample = &bytes[..sample_size];
-
-                    // Detect binary characteristics
-                    // 1. Detect NULL bytes (text files do not have NULL bytes)
-                    if sample.iter().any(|&b| b == 0) {
-                        return false;
-                    }
-
-                    // 2. Check the ratio of control characters
-                    let control_chars_count = sample
-                        .iter()
-                        .filter(|&&b| {
-                            b < 32 && b != 9 && b != 10 && b != 13 // Exclude Tab, LF, CR
-                        })
-                        .count();
-
-                    // If the ratio of control characters is too high, consider it binary
-                    if (control_chars_count as f32 / sample_size as f32) > 0.3 {
-                        return false;
-                    }
-
-                    // 3. Check if it is valid UTF-8
-                    let is_valid_utf8 = std::str::from_utf8(sample).is_ok();
-
-                    // 4. Check the ASCII ratio
-                    let ascii_ratio =
-                        sample.iter().filter(|&&b| b <= 127).count() as f32 / sample_size as f32;
-
-                    // Valid UTF-8 with a high ASCII ratio, or specific non-UTF-8 encoding characteristics
-                    is_valid_utf8 || ascii_ratio > 0.8
-                }
-                _ => false, // Do not consider files with read errors or size 0 as text
-            }
-        }
-
-        // Function to recursively process directory entries
-        fn process_directory(
-            dir_path: &Path,
-            index_writer: &mut tantivy::IndexWriter,
-            path_field: tantivy::schema::Field,
-            content_field: tantivy::schema::Field,
-            binary_extensions: &[&str],
+        // Recursively process directory
+        fn scan_directory(
+            dir: &Path,
             skip_dirs: &[&str],
-            indexed_files_count: &mut usize,
-            found_files_count: &mut usize,
-            skipped_files_count: &mut usize,
+            binary_extensions: &[&str],
+            files: &mut HashMap<PathBuf, i64>,
         ) -> Result<(), String> {
-            for entry in fs::read_dir(dir_path)
-                .map_err(|e| format!("Directory read error '{}': {}", dir_path.display(), e))?
-            {
-                let entry = entry.map_err(|e| format!("Entry read error: {}", e))?;
+            for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
                 let path = entry.path();
-
                 if path.is_dir() {
-                    // Recursively process subdirectories (add depth limit if needed)
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if skip_dirs.iter().any(|&d| d == name) {
-                            tracing::debug!("Skipping directory: {}", path.display());
+                        if skip_dirs.contains(&name) {
                             continue;
                         }
                     }
-                    process_directory(
-                        &path,
-                        index_writer,
-                        path_field,
-                        content_field,
-                        binary_extensions,
-                        skip_dirs,
-                        indexed_files_count,
-                        found_files_count,
-                        skipped_files_count,
-                    )?;
+                    scan_directory(&path, skip_dirs, binary_extensions, files)?;
                 } else if path.is_file() {
-                    *found_files_count += 1;
-
-                    // More universal text file determination
-                    if is_text_file(&path, binary_extensions) {
-                        match fs::read_to_string(&path) {
-                            Ok(content) => {
-                                if !content.trim().is_empty() {
-                                    index_writer
-                                        .add_document(doc!(
-                                            path_field => path.to_string_lossy().to_string(),
-                                            content_field => content,
-                                        ))
-                                        .map_err(|e| format!("Document addition error: {}", e))?;
-                                    *indexed_files_count += 1;
-                                    tracing::debug!("Indexed: {}", path.display());
-                                } else {
-                                    *skipped_files_count += 1;
-                                    tracing::debug!("Skipped (empty file): {}", path.display());
-                                }
-                            }
-                            Err(e) => {
-                                // Skip and continue on read errors
-                                *skipped_files_count += 1;
-                                tracing::debug!("Skipped (read error): {} - {}", path.display(), e);
-                            }
+                    if let Some(ext) = path.extension() {
+                        let ext_str = ext.to_string_lossy().to_lowercase();
+                        if binary_extensions.contains(&ext_str.as_str()) {
+                            continue;
                         }
-                    } else {
-                        *skipped_files_count += 1;
-                        tracing::debug!("Skipped (non-text): {}", path.display());
                     }
+                    let mtime = fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
+                        .unwrap_or(0);
+                    files.insert(path, mtime);
                 }
             }
             Ok(())
         }
 
-        // Execute directory processing
-        tracing::info!("Starting indexing for: {}", dir_path.display());
-        process_directory(
+        scan_directory(
             dir_path,
-            &mut index_writer,
-            path_field,
-            content_field,
-            &binary_extensions,
             &skip_dirs,
-            &mut indexed_files_count,
-            &mut found_files_count,
-            &mut skipped_files_count,
+            &binary_extensions,
+            &mut current_scan_files,
         )?;
+        let found_files_count = current_scan_files.len();
+
+        // Incremental Update Logic
+        for (path, mtime) in current_scan_files {
+            let path_str = path.to_string_lossy().to_string();
+            let needs_update = match existing_files.get(&path_str) {
+                Some(&old_mtime) => old_mtime != mtime,
+                None => true,
+            };
+
+            if needs_update {
+                if is_text_file(&path) {
+                    match fs::read_to_string(&path) {
+                        Ok(content) => {
+                            if !content.trim().is_empty() {
+                                // Delete old version if it exists
+                                index_writer
+                                    .delete_term(Term::from_field_text(path_field, &path_str));
+
+                                index_writer
+                                    .add_document(doc!(
+                                        path_field => path_str,
+                                        content_field => content,
+                                        modified_field => mtime,
+                                    ))
+                                    .map_err(|e| e.to_string())?;
+                                indexed_files_count += 1;
+                                tracing::debug!("Indexed/Updated: {}", path.display());
+                            } else {
+                                skipped_files_count += 1;
+                            }
+                        }
+                        Err(_) => skipped_files_count += 1,
+                    }
+                } else {
+                    skipped_files_count += 1;
+                }
+            }
+        }
+
+        // Identify and remove deleted files
+        for path_str in existing_files.keys() {
+            if !Path::new(path_str).exists() {
+                index_writer.delete_term(Term::from_field_text(path_field, path_str));
+                deleted_files_count += 1;
+                tracing::debug!("Deleted from index: {}", path_str);
+            }
+        }
+
+        fn is_text_file(path: &Path) -> bool {
+            match fs::read(path) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    let sample_size = std::cmp::min(bytes.len(), 8192);
+                    let sample = &bytes[..sample_size];
+                    if sample.iter().any(|&b| b == 0) {
+                        return false;
+                    }
+                    let control_chars = sample
+                        .iter()
+                        .filter(|&&b| b < 32 && b != 9 && b != 10 && b != 13)
+                        .count();
+                    if (control_chars as f32 / sample_size as f32) > 0.3 {
+                        return false;
+                    }
+                    std::str::from_utf8(sample).is_ok()
+                        || (sample.iter().filter(|&&b| b <= 127).count() as f32
+                            / sample_size as f32)
+                            > 0.8
+                }
+                _ => false,
+            }
+        }
 
         let indexing_duration = start_time.elapsed();
-        tracing::info!(
-            "Indexing complete in {:?}: Found={}, Indexed={}, Skipped={}",
+        tracing::debug!(
+            "Indexing complete in {:?}: Found={}, Indexed/Updated={}, Deleted={}, Skipped={}",
             indexing_duration,
             found_files_count,
             indexed_files_count,
+            deleted_files_count,
             skipped_files_count
         );
 
-        // Return an error if no files were indexed
-        if indexed_files_count == 0 {
-            return Ok(format!(
-                "No text files were indexed in '{}' (took {:?}).",
-                params.directory, indexing_duration
-            ));
-        }
-
-        // 5. Commit the index
-        let commit_start = std::time::Instant::now();
+        // 5. Commit changes
         index_writer
             .commit()
             .map_err(|e| format!("Commit error: {}", e))?;
-        tracing::debug!("Commit complete in {:?}", commit_start.elapsed());
 
-        // 6. Generate reader and searcher for searching
+        // 6. Search
         let search_start = std::time::Instant::now();
         let reader = index.reader().map_err(|e| e.to_string())?;
         let searcher = reader.searcher();
-
-        // 7. Parse query containing the keyword
         let query_parser = QueryParser::for_index(&index, vec![content_field]);
 
-        // Ensure the keyword is not empty
         if params.keyword.trim().is_empty() {
             return Err("Search keyword is empty.".into());
         }
@@ -334,16 +375,13 @@ impl SearchTool {
             .parse_query(&params.keyword)
             .map_err(|e| format!("Query parse error: {}", e))?;
 
-        // 8. Retrieve top 10 search results
         let top_docs = searcher
             .search(&query, &TopDocs::with_limit(10))
             .map_err(|e| format!("Search error: {}", e))?;
 
-        // 9. Concatenate file paths from search results into a string
         let mut result_str = String::new();
         for (score, doc_address) in &top_docs {
-            let retrieved_doc: TantivyDocument =
-                searcher.doc(*doc_address).map_err(|e| e.to_string())?;
+            let retrieved_doc: TantivyDocument = searcher.doc(*doc_address).map_err(|e| e.to_string())?;
             let path_value = retrieved_doc
                 .get_first(path_field)
                 .and_then(|v| v.as_str())
@@ -352,13 +390,13 @@ impl SearchTool {
         }
 
         let total_duration = start_time.elapsed();
-        tracing::info!("Search completed in {:?}", search_start.elapsed());
-        tracing::info!("Total request time: {:?}", total_duration);
+        tracing::debug!("Search completed in {:?}", search_start.elapsed());
+
 
         if result_str.is_empty() {
             Ok(format!(
-                "No results for '{}'. Indexed {} files in {:?}.",
-                params.keyword, indexed_files_count, indexing_duration
+                "No results for '{}' in '{}'. (took {:?})",
+                params.keyword, params.directory, total_duration
             ))
         } else {
             Ok(format!(
@@ -378,12 +416,18 @@ mod tests {
 
     #[test]
     fn test_skip_dirs_logic() {
-        let skip_dirs = [".git", "target", "node_modules", ".vscode", "build", "dist"];
+        let skip_dirs = [
+            ".git", "target", "node_modules", ".vscode", "build", "dist",
+            ".venv", "venv", "env", "__pycache__", ".tox",
+            ".next", ".nuxt", ".svelte-kit", ".turbo",
+        ];
         let test_cases = [
             (".git", true),
             ("target", true),
             ("src", false),
             ("node_modules", true),
+            (".venv", true),
+            ("__pycache__", true),
             ("my_folder", false),
         ];
 
@@ -397,6 +441,24 @@ mod tests {
                 dir_name
             );
         }
+    }
+
+    #[test]
+    fn test_index_path_is_consistent() {
+        let tool = SearchTool::new();
+        let path1 = tool.get_index_path(".").unwrap();
+        let path2 = tool.get_index_path(".").unwrap();
+        assert_eq!(
+            path1, path2,
+            "Index path should be consistent for the same directory"
+        );
+
+        // Use a definitely different path
+        let path3 = tool.get_index_path("/tmp").unwrap();
+        assert_ne!(
+            path1, path3,
+            "Different directories should have different index paths"
+        );
     }
 }
 
